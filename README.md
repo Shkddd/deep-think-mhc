@@ -36,7 +36,7 @@ This repo provides a **highly accurate, readable reproduction** of mHC for resea
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/deep-think-mhc.git
+git clone https://github.com/Shkddd/deep-think-mhc.git
 cd deep-think-mhc
 pip install torch  # PyTorch 2.0+ recommended
 ```
