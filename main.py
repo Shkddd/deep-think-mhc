@@ -1,268 +1,211 @@
-import math
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
-# Define RMSNorm as per standard implementation
+# 实现 RMSNorm（Root Mean Square Layer Normalization）
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim, eps=1e-8):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(input_dtype)
+    def forward(self, x):
+        # RMSNorm 公式：x * weight / sqrt(mean(x^2) + eps)
+        norm = x.norm(2, dim=-1, keepdim=True)
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
 
-# mHCLayer implementation based on the paper details
-class mHCLayer(nn.Module):
+def sinkhorn_knopp(log_mat, num_iters=20, eps=1e-8):
     """
-    mHC Layer: Manifold-Constrained Hyper-Connections, replacing standard residual connections.
-    Based on the exact formulations from the DeepSeek mHC paper.
+    可微的 Sinkhorn-Knopp 迭代，将输入矩阵转换为双随机矩阵。
+    Args:
+        log_mat: [*, n, n] 输入矩阵（log域）
+        num_iters: 迭代次数
+        eps: 数值稳定性常数
+    Returns:
+        [*, n, n] 双随机矩阵
     """
-    def __init__(self, dim, expansion_rate=4, sinkhorn_iter=20, gate_init=0.01, eps=1e-8):
+    # 确保输入为正（通过 exp）
+    mat = torch.exp(log_mat)
+    for _ in range(num_iters):
+        # 列归一化
+        mat = mat / (mat.sum(dim=-2, keepdim=True) + eps)
+        # 行归一化
+        mat = mat / (mat.sum(dim=-1, keepdim=True) + eps)
+    return mat
+
+class MHCLayer(nn.Module):
+    """
+    Manifold-Constrained Hyper-Connections (mHC) 层。
+    Args:
+        dim: 输入维度 C
+        n_streams: 扩展率 n
+        hidden_dim: 残差函数 F 的隐藏维度
+        sinkhorn_iters: Sinkhorn 迭代次数
+        dropout: Dropout 概率
+    """
+    def __init__(self, dim, n_streams=4, hidden_dim=None, sinkhorn_iters=20, dropout=0.0):
         super().__init__()
         self.dim = dim
-        self.n = expansion_rate
-        self.sinkhorn_iter = sinkhorn_iter
-        self.eps = eps
-        
-        # RMSNorm for the flattened hidden state
-        self.rms = RMSNorm(self.n * self.dim)
-        
-        # Gating factors
-        self.alpha_pre = nn.Parameter(torch.tensor(gate_init))
-        self.alpha_post = nn.Parameter(torch.tensor(gate_init))
-        self.alpha_res = nn.Parameter(torch.tensor(gate_init))
-        
-        # Projection weights (using Linear for standard init)
-        self.phi_pre = nn.Linear(self.n * self.dim, self.n, bias=False)
-        self.phi_post = nn.Linear(self.n * self.dim, self.n, bias=False)
-        self.phi_res = nn.Linear(self.n * self.dim, self.n ** 2, bias=False)
-        
-        # Static biases
-        self.b_pre = nn.Parameter(torch.zeros(self.n))
-        self.b_post = nn.Parameter(torch.zeros(self.n))
-        self.b_res = nn.Parameter(torch.zeros(self.n, self.n))
-        
-        # Initialize biases to approximate identity mapping
-        with torch.no_grad():
-            # For H_pre ~ (1, 0, ..., 0)
-            self.b_pre.fill_(-10.0)
-            self.b_pre[0] = 10.0
-            # For H_post ~ (1, 0, ..., 0) since 2 * sigmoid
-            self.b_post.fill_(-10.0)
-            self.b_post[0] = 0.0  # sigmoid(0) = 0.5, 2*0.5=1
-            # For H_res ~ eye
-            self.b_res.fill_(-10.0)
-            self.b_res.diagonal().fill_(10.0)
+        self.n_streams = n_streams
+        self.sinkhorn_iters = sinkhorn_iters
 
-    def sinkhorn_knopp(self, mat):
-        """Sinkhorn-Knopp iteration to project to doubly stochastic matrix"""
-        # mat: (BT, n, n)
-        mat = torch.exp(mat)
-        for _ in range(self.sinkhorn_iter):
-            mat = mat / mat.sum(dim=-1, keepdim=True).clamp(min=self.eps)
-            mat = mat / mat.sum(dim=-2, keepdim=True).clamp(min=self.eps)
-        return mat
+        if hidden_dim is None:
+            hidden_dim = dim * 4
 
-    def forward(self, x, func):
-        # x: (B, T, C)
-        B, T, C = x.shape
-        BT = B * T
-        
-        # Expand to multi-stream hidden: (B, T, n, C), first stream is x, others 0
-        hidden = torch.zeros(B, T, self.n, C, dtype=x.dtype, device=x.device)
-        hidden[:, :, 0, :] = x
-        
-        # Flatten: (BT, n*C)
-        flattened = hidden.view(BT, self.n * C)
-        
-        # RMSNorm
-        x_prime = self.rms(flattened)
-        
-        # Compute tilde mappings
-        tilde_pre = self.alpha_pre * self.phi_pre(x_prime) + self.b_pre
-        tilde_post = self.alpha_post * self.phi_post(x_prime) + self.b_post
-        tilde_res = self.alpha_res * self.phi_res(x_prime).view(BT, self.n, self.n) + self.b_res
-        
-        # Final constrained mappings
-        H_pre = torch.sigmoid(tilde_pre)  # (BT, n)
-        H_post = 2.0 * torch.sigmoid(tilde_post)  # (BT, n)
-        H_res = self.sinkhorn_knopp(tilde_res)  # (BT, n, n)
-        
-        # Project input to func: H_pre @ hidden (as row vector mult)
-        # H_pre.unsqueeze(1): (BT, 1, n), hidden.view(BT, n, C): (BT, n, C)
-        pre_x = torch.bmm(H_pre.unsqueeze(1), hidden.view(BT, self.n, C)).squeeze(1)  # (BT, C)
-        
-        # Apply func (e.g., attention or FFN)
-        func_out = func(pre_x.view(B, T, C))  # (B, T, C)
-        func_out_bt = func_out.view(BT, C)  # (BT, C)
-        
-        # Compute add term: H_post^T @ func_out (column @ row)
-        # H_post.unsqueeze(2): (BT, n, 1), func_out_bt.unsqueeze(1): (BT, 1, C)
-        add_term = torch.bmm(H_post.unsqueeze(2), func_out_bt.unsqueeze(1))  # (BT, n, C)
-        
-        # Compute res term: H_res @ hidden
-        res_term = torch.bmm(H_res, hidden.view(BT, self.n, C))  # (BT, n, C)
-        
-        # Combine
-        out_expanded = res_term + add_term  # (BT, n, C)
-        
-        # Output the main stream (first stream)
-        out = out_expanded[:, 0, :].view(B, T, C)
-        
-        return out
+        # RMSNorm（对最后一维进行归一化）
+        self.rms_norm = RMSNorm(dim * n_streams)
 
-# Modified to use mHCLayer for both attention and FFN residuals.
+        # 动态映射的线性投影
+        # φ_pre, φ_post: [nC, n]；φ_res: [nC, n^2]
+        self.proj_dynamic = nn.Linear(
+            dim * n_streams,
+            n_streams * n_streams + 2 * n_streams,  # n^2 + 2n
+            bias=False
+        )
 
-class GPTConfig:
-    """ Config class from nanoGPT """
-    def __init__(self, vocab_size=50304, n_layer=12, n_head=12, n_embd=768, dropout=0.0, bias=True, block_size=1024):
-        self.vocab_size = vocab_size
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.dropout = dropout
-        self.bias = bias
-        self.block_size = block_size
+        # 静态映射的偏置
+        self.bias_pre = nn.Parameter(torch.zeros(1, n_streams))
+        self.bias_post = nn.Parameter(torch.zeros(1, n_streams))
+        self.bias_res = nn.Parameter(torch.zeros(n_streams, n_streams))
 
-class LayerNorm(nn.Module):
-    """ LayerNorm from nanoGPT """
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        # 可学习的门控因子 α
+        self.alpha_pre = nn.Parameter(torch.zeros(1))
+        self.alpha_post = nn.Parameter(torch.zeros(1))
+        self.alpha_res = nn.Parameter(torch.zeros(1))
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        # 残差函数 F（例如 MLP）
+        self.residual_fn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
 
-class CausalSelfAttention(nn.Module):
-    """ CausalSelfAttention from nanoGPT (simplified, no flash) """
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        # 输出投影（将 n*C 维映射回 C 维）
+        self.out_proj = nn.Linear(dim * n_streams, dim)
+
+        self._init_parameters()
+
+    def _init_parameters(self):
+        # 动态投影使用 Xavier 初始化
+        nn.init.xavier_uniform_(self.proj_dynamic.weight)
+        # 门控因子初始化为小值
+        nn.init.constant_(self.alpha_pre, 0.01)
+        nn.init.constant_(self.alpha_post, 0.01)
+        nn.init.constant_(self.alpha_res, 0.01)
+        # 偏置初始化为零
+        nn.init.zeros_(self.bias_pre)
+        nn.init.zeros_(self.bias_post)
+        nn.init.zeros_(self.bias_res)
 
     def forward(self, x):
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        """
+        Args:
+            x: [B, L, C] 输入张量
+        Returns:
+            [B, L, C] 输出张量
+        """
+        B, L, C = x.shape
+        n = self.n_streams
 
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        # 1. 扩展为多流残差：将输入复制 n 份，构建隐藏矩阵 [B, L, n, C]
+        x_exp = x.unsqueeze(2).expand(-1, -1, n, -1)  # [B, L, n, C]
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        # 2. 展平用于后续计算
+        x_flat = x_exp.reshape(B, L, -1)  # [B, L, n*C]
 
-# Modified Block using mHCLayer for both residuals
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-        # mHC layers
-        self.mhc_att = mHCLayer(config.n_embd)
-        self.mhc_ffn = mHCLayer(config.n_embd)
+        # 3. RMSNorm（对最后一维归一化）
+        x_norm = self.rms_norm(x_flat)  # [B, L, n*C]
 
-    def forward(self, x):
-        # mHC for attention
-        x = self.mhc_att(self.ln_1(x), self.attn)
-        # mHC for FFN
-        x = self.mhc_ffn(self.ln_2(x), self.mlp)
-        return x
+        # 4. 动态映射线性投影
+        dynamic = self.proj_dynamic(x_norm)  # [B, L, n^2 + 2n]
 
-# Simple GPT model using the modified Block
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Share weights
-        self.transformer.wte.weight = self.lm_head.weight
+        # 分离出 H_pre, H_post, H_res 的动态部分
+        dynamic_pre = dynamic[..., :n]  # [B, L, n]
+        dynamic_post = dynamic[..., n:2*n]  # [B, L, n]
+        dynamic_res = dynamic[..., 2*n:]  # [B, L, n^2]
 
-        # Init weights
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+        # 5. 计算映射矩阵（式 (7)）
+        # H_pre: [B, L, n]
+        H_pre_dyn = self.alpha_pre * dynamic_pre + self.bias_pre
+        # H_post: [B, L, n]
+        H_post_dyn = self.alpha_post * dynamic_post + self.bias_post
+        # H_res: [B, L, n, n]
+        H_res_dyn = self.alpha_res * dynamic_res.view(B, L, n, n) + self.bias_res
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # 6. 流形约束（式 (8)）
+        # H_pre 使用 Sigmoid 约束到 (0,1)
+        H_pre = torch.sigmoid(H_pre_dyn)  # [B, L, n]
+        # H_post 使用 2*Sigmoid 约束到 (0,2)
+        H_post = 2 * torch.sigmoid(H_post_dyn)  # [B, L, n]
+        # H_res 通过 Sinkhorn-Knopp 投影为双随机矩阵
+        H_res = sinkhorn_knopp(H_res_dyn, self.sinkhorn_iters)  # [B, L, n, n]
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # 7. 残差路径计算（式 (3)）
+        # 7.1 预映射：H_pre * x_l
+        pre_mixed = torch.einsum('bln,blnc->blc', H_pre, x_exp)  # [B, L, C]
 
-        tok_emb = self.transformer.wte(idx)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        # 7.2 残差函数 F
+        f_out = self.residual_fn(pre_mixed)  # [B, L, C]
 
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
+        # 7.3 将 F 的输出扩展回 n 流
+        f_out_exp = f_out.unsqueeze(2).expand(-1, -1, n, -1)  # [B, L, n, C]
 
-        return logits, loss
+        # 7.4 后映射：H_post^T * F(...)
+        # 注意：论文中 H_post 是行向量，这里使用转置进行乘法
+        post_mixed = torch.einsum('bln,blnc->blnc', H_post, f_out_exp)  # [B, L, n, C]
 
-# Demo usage: Create a small model
+        # 7.5 残差映射：H_res * x_l
+        res_mixed = torch.einsum('blnm,blmc->blnc', H_res, x_exp)  # [B, L, n, C]
+
+        # 8. 合并两条路径
+        stream_out = res_mixed + post_mixed  # [B, L, n, C]
+
+        # 9. 将多流输出合并为单流
+        merged = stream_out.reshape(B, L, -1)  # [B, L, n*C]
+        output = self.out_proj(merged)  # [B, L, C]
+
+        # 10. 残差连接（保持恒等映射）
+        output = output + x
+
+        return output
+
+# 测试代码
 if __name__ == "__main__":
-    config = GPTConfig(vocab_size=50304, n_layer=2, n_head=2, n_embd=64, dropout=0.1, block_size=128)
-    model = GPT(config)
-    print(model)
+    torch.manual_seed(42)
+    batch_size = 4
+    seq_len = 16
+    dim = 128
+    n_streams = 4
 
-    # Dummy input
-    idx = torch.randint(0, config.vocab_size, (4, 32))  # batch_size=4, seq_len=32
-    logits, loss = model(idx)
-    print(f"Logits shape: {logits.shape}")
-```
+    model = MHCLayer(dim=dim, n_streams=n_streams, hidden_dim=512, dropout=0.1)
+    x = torch.randn(batch_size, seq_len, dim, requires_grad=True)
+
+    print(f"Input shape: {x.shape}")
+    output = model(x)
+    print(f"Output shape: {output.shape}")
+
+    # 梯度检查
+    loss = output.mean()
+    loss.backward()
+    print(f"Input grad norm: {x.grad.norm().item():.4f}")
+    print(f"Dynamic projection weight grad norm: {model.proj_dynamic.weight.grad.norm().item():.4f}")
+    
+    # 打印一些额外的信息
+    print(f"\nModel parameters:")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"alpha_pre value: {model.alpha_pre.item():.6f}")
+    print(f"alpha_post value: {model.alpha_post.item():.6f}")
+    print(f"alpha_res value: {model.alpha_res.item():.6f}")
+    
+    # 检查双随机矩阵的性质
+    B, L = x.shape[0], x.shape[1]
+    H_res_sample = sinkhorn_knopp(model.alpha_res * torch.randn(1, 1, n_streams, n_streams) + model.bias_res, model.sinkhorn_iters)
+    print(f"\nSample H_res properties:")
+    print(f"H_res shape: {H_res_sample.shape}")
+    print(f"Row sums: {H_res_sample.sum(dim=-1)}")
+    print(f"Column sums: {H_res_sample.sum(dim=-2)}")
+    
+    print("\n前向与反向传播测试通过。")
