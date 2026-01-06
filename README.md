@@ -176,10 +176,10 @@ class TransformerWithMHC(nn.Module):
 If you use this implementation in your research, please cite the original paper:
 
 ```bibtex
-@misc{deepseek2024mhc,
+@misc{deepseek2025mhc,
       title={mHC: Manifold-Constrained Hyper-Connections}, 
       author={DeepSeek},
-      year={2024},
+      year={2025},
       eprint={2512.24880},
       archivePrefix={arXiv},
       primaryClass={cs.LG}
