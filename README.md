@@ -46,23 +46,11 @@ pip install torch  # PyTorch 2.0+ recommended
 Run the demo script:
 
 ```bash
-python mhc_nanogpt.py
+python main.py
 ```
 
 This creates a tiny GPT model (2 layers, 64-dim embeddings) with mHC residuals and runs a forward pass on random tokens.
 
-### Usage in Your Own Models
-
-```python
-from mhc_layer import mHCLayer
-from block import Block  # Already uses mHCLayer for both residuals
-
-# Or manually:
-def forward(self, x):
-    x = self.mhc_attn(self.ln_1(x), self.attn)
-    x = self.mhc_ffn(self.ln_2(x), self.mlp)
-    return x
-```
 
 ### Configuration Options (in `mHCLayer`)
 
@@ -73,18 +61,6 @@ def forward(self, x):
 | `sinkhorn_iter`   | 20      | Sinkhorn-Knopp iterations (paper uses 20)|
 | `gate_init`       | 0.01    | Initial value for α parameters           |
 
-### Citation
-
-If you use this implementation or find it helpful, please cite the original DeepSeek paper:
-
-```bibtex
-@article{xie2025mhc,
-  title={mHC: Manifold-Constrained Hyper-Connections},
-  author={Zhenda Xie and others},
-  journal={arXiv preprint arXiv:2512.24880},
-  year={2025}
-}
-```
 
 ### Notes
 
